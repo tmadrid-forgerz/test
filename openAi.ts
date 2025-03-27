@@ -1,7 +1,6 @@
 import OpenAI from "openai";
-import { querySourceType, getAllEntries, insertSource } from '~~/server/utils/milvus';
+import { querySourceType, insertSource } from '~~/server/utils/milvus';
 import { encoding_for_model } from 'tiktoken';
-import { max } from "lodash";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY ?? 'apiKey',
@@ -21,26 +20,6 @@ function countTokens(text: string): number {
     return tokenizer.encode(text).length;
 }
 
-/**
- * Counts the tokens of a vector or an array of vectors using tiktoken.
- * @param vectors - A single vector (`number[]`) or multiple vectors (`number[][]`).
- * @returns The total token count.
- */
-function countVectorTokens(vectors: number[] | number[][]): number {
-    const tokenizer = encoding_for_model(encodingModel);
-
-    if (Array.isArray(vectors[0])) {
-        // If it's a 2D array (number[][]), flatten it into a single array
-        const flattenedVector = (vectors as number[][]).flat();
-        const vectorString = flattenedVector.join(' '); // Convert to a string
-        return tokenizer.encode(vectorString).length;
-    } else {
-        // If it's a 1D array (number[]), convert it to a string
-        const vectorString = (vectors as number[]).join(' ');
-        return tokenizer.encode(vectorString).length;
-    }
-}
-
 export async function createEmbedding(content: string) {
     const embedding = await openai.embeddings.create({
         model: "text-embedding-ada-002",
@@ -54,21 +33,60 @@ export async function createEmbedding(content: string) {
     return embedding.data[0].embedding;
 }
 
-function splitIntoChunks(text: string, maxTokens: number=tokenLimit/2): string[] {
-    const words = text.split(/\s+/); // Split by whitespace
-    const chunks = [];
-    for (let i = 0; i < words.length; i += maxTokens) {
-        const chunk = words.slice(i, i + maxTokens).join(' ');
-        if (chunk.trim() !== '') { // Ensure the chunk is not empty
-            chunks.push(chunk);
+export async function createBatchEmbeddings(contents: string[]): Promise<number[][]> {
+    const embedding = await openai.embeddings.create({
+        model: "text-embedding-ada-002",
+        input: contents, // Send multiple contents in one request
+    });
+
+    if (!embedding || !embedding.data || !Array.isArray(embedding.data)) {
+        throw new Error('Failed to generate valid embeddings from OpenAI.');
+    }
+
+    return embedding.data.map((item: any) => item.embedding);
+}
+
+function splitIntoChunks(content: string, maxTokens: number = tokenLimit / 2): string[] {
+    const chunks: string[] = [];
+    let currentChunk = '';
+    const lines = content.split(/\s+/);
+
+    for (const line of lines) {
+        // Check if adding the current line exceeds the maxChars
+        // If the current line exceeds maxChars, push the current chunk and start a new one
+        if (line.length > maxTokens) {
+            if (currentChunk.trim().length > 0) {
+                chunks.push(currentChunk.trim());
+            }
+            // If a single line exceeds the limit, split it into smaller chunks
+            let startIdx = 0;
+            while (startIdx < line.length) {
+                const endIdx = Math.min(startIdx + maxTokens, line.length);
+                chunks.push(line.slice(startIdx, endIdx));
+                startIdx = endIdx;
+            }
+            currentChunk = ''; // Reset currentChunk
+        } else if ((currentChunk + line).length > maxTokens) {
+            // If adding the line exceeds maxChars, push the current chunk and start a new one
+            chunks.push(currentChunk.trim());
+            currentChunk = line;
+        } else {
+            // Otherwise, add the line to the current chunk
+            currentChunk += line + ' ';
         }
     }
+
+    // Push the last chunk if it has content
+    if (currentChunk.trim() !== '') {
+        chunks.push(currentChunk.trim());
+    }
+
     return chunks;
 }
 
 export async function createChunkEmbedding(content: string): Promise<number[][]> {
     // Split content into chunks
-    const chunks = splitIntoChunks(content);
+    const chunks = splitIntoChunks(content, tokenLimit);
     const embeddings: number[][] = [];
 
     for (const chunk of chunks) {
@@ -114,10 +132,8 @@ export async function summarizeContent(
 
     const maxTokens = tokenLimit / 2;
 
-    // Tokenize the content using tiktoken
     const tokens = encoding.encode(content);
 
-    // If the token count exceeds the limit, truncate it
     if (tokens.length > maxTokens) {
         console.log(`Content exceeds ${maxTokens} tokens, truncating...`);
         // Truncate to the maximum allowed number of tokens
@@ -127,10 +143,8 @@ export async function summarizeContent(
     // Convert tokens back to text
     const truncatedContent = encoding.decode(tokens);
 
-    // Now, let's ensure that the truncated content fits within the maxTokens
     let resultLimit = maxTokens - tokens.length;
 
-    // Prepare the messages for the summarization request
     const messages = [
         {
             role: "system",
@@ -142,7 +156,6 @@ export async function summarizeContent(
         }
     ];
 
-    // Make the request for summarization
     const summary = await getLLMResponse(messages, resultLimit);
 
     if (summary) {
@@ -165,10 +178,38 @@ export async function summarizeContent(
 /**
  * Determines if a file is logically valuable by excluding files such as packages or vendor modules.
  */
-function isValidCodeFile(fileName: string): boolean {
+export function isValidCodeFile(fileName: string): boolean {
     const lowerFileName = fileName.toLowerCase();
-    const excludePatterns = ["node_modules", "package.json", "package-lock.json", "yarn.lock", "tsconfig", ".min.js", "vendor"];
-    return !excludePatterns.some(pattern => lowerFileName.includes(pattern));
+
+    // Exclude patterns for files and directories
+    const excludePatterns = [
+        "node_modules",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "tsconfig",
+        ".min.js",
+        "vendor",
+        ".db",
+        "migrations",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".bmp",
+        ".tiff",
+        ".ico",
+        "components/ui",
+        "public"
+        
+    ];
+
+    return !(
+        lowerFileName.startsWith('.') || // Ignore hidden files
+        excludePatterns.some(pattern => lowerFileName.includes(pattern))
+    );
 }
 
 /**
@@ -189,13 +230,15 @@ async function generateNLExplanationForFile(fileContent: string, fileName: strin
     if (tokens > maxTokens) {
         console.log(`File "${fileName}" exceeds ${maxTokens} tokens. Splitting into chunks...`);
         const chunks = splitIntoChunks(contentToProcess, maxTokens);
-        const chunkLimit = maxTokens / chunks.length
+        console.log('chunks length:', chunks.length)
+        const chunkLimit = Math.floor(maxTokens / chunks.length)
         // Summarize each chunk
         for (const chunk of chunks) {
+
             const chunkMessages = [
                 {
                     role: "system",
-                    content: `You are a software analysis assistant. Analyze the following chunk of source code from the file "${fileName}" and generate a clear, plain language explanation of its main functionalities and purpose.`
+                    content: `You are a software analysis assistant. Analyze the source code in the file "${fileName}" and generate a clear, plain language explanation of its main functionalities and overall purpose. Focus on the logical value of the code.`
                 },
                 {
                     role: "user",
@@ -204,7 +247,6 @@ async function generateNLExplanationForFile(fileContent: string, fileName: strin
             ];
 
             const chunkSummary = await getLLMResponse(chunkMessages, chunkLimit);
-            console.log('asdfasdfsadfasdfasdfsdfsdf')
             if (chunkSummary) {
                 chunkSummaries.push(chunkSummary.trim());
             }
@@ -218,7 +260,7 @@ async function generateNLExplanationForFile(fileContent: string, fileName: strin
     const finalMessages = [
         {
             role: "system",
-            content: `You are a software analysis assistant. Analyze the following source code from the file "${fileName}" and generate a clear, plain language explanation of its main functionalities and overall purpose. Focus on the logical value of the code.`
+            content: `You are a software analysis assistant. Based on the provided natural language explanations of individual source code files, generate a comprehensive overview of the software. Explain its overall purpose, main functionalities, and architecture in plain language.`
         },
         {
             role: "user",
@@ -232,71 +274,41 @@ async function generateNLExplanationForFile(fileContent: string, fileName: strin
 
 /**
  * Processes the initial import of the codebase:
- * - Iterates over all source code files in the RAG,
- * - Filters out files that are not valuable,
  * - Generates natural language explanations for each valid file,
  * - And stores these explanations in the RAG.
  */
-export async function processInitialImportForNLExplanations(collectionName: string, repositoryId: number, files: any[]): Promise<void> {    
-    for (const entry of  files) {
-        const fileContent = entry.content;
-        const fileName = entry.fileName || "Unnamed File";
-        
-        if (!isValidCodeFile(fileName)) {
-            continue;
-        }
-        
-        const nlExplanation = await generateNLExplanationForFile(fileContent, fileName);
-        const vector = await createEmbedding(nlExplanation)
-        await insertSource(collectionName, repositoryId, 'nl_explanation', fileName, [vector], nlExplanation);
-    }
-}
-  
-/**
- * Generates global summaries from the NL explanations stored in the RAG.
- * This includes:
- *  - A global overview of the software,
- *  - A detailed list of features.
- */
-export async function generateGlobalSummaries(collectionName: string): Promise<{ globalOverview: string, detailedFeatures: string }> {
-    // Retrieve all NL explanation entries.
-    const explanationEntries = await querySourceType(collectionName, 'nl_explanation');
-    let combinedExplanations = explanationEntries.data.map((entry: any) => entry.content).join('\n\n');
+export async function processInitialImportForNLExplanations(
+    collectionName: string,
+    repositoryId: number,
+    files: any[]
+): Promise<void> {
+    const nlExplanations = await Promise.all(
+        files.map(async (entry) => {
+            const fileContent = entry.content;
+            const fileName = entry.fileName || "Unnamed File";
     
-    if (countTokens(combinedExplanations) > tokenLimit) {
-      combinedExplanations = await summarizeContent(combinedExplanations);
-    }
+            if (!isValidCodeFile(fileName)) {
+                return null; // Skip invalid files
+            }
     
-    const globalMessages = [
-      {
-        role: "system",
-        content: `You are a software documentation assistant. Based on the provided natural language explanations of individual source code files, generate a comprehensive overview of the software. Explain its overall purpose, main functionalities, and architecture in plain language.`
-      },
-      {
-        role: "user",
-        content: combinedExplanations
-      }
-    ];
+            return await generateNLExplanationForFile(fileContent, fileName);
+        })
+    );
     
-    const globalOverview = await getLLMResponse(globalMessages) || "";
+    // Filter out null explanations
+    const validExplanations = nlExplanations.filter((explanation) => explanation !== null);
     
-    const featureMessages = [
-      {
-        role: "system",
-        content: `You are a software analysis assistant. From the provided natural language explanations, extract and list all the detailed features of the software. For each feature, provide a brief functional description in plain language.`
-      },
-      {
-        role: "user",
-        content: combinedExplanations
-      }
-    ];
+    // Generate embeddings in batch
+    const vectors = await createBatchEmbeddings(validExplanations);
     
-    const detailedFeatures = await getLLMResponse(featureMessages) || "";
-    
-    return {
-      globalOverview: globalOverview.trim(),
-      detailedFeatures: detailedFeatures.trim()
-    };
+    // Insert each explanation and its embedding into the database
+    await Promise.all(
+        validExplanations.map((explanation, index) => {
+            const fileName = files[index].fileName || "Unnamed File";
+            const contentVectors = [vectors[index]]
+            return insertSource(collectionName, repositoryId, 'nl_explanation', fileName, contentVectors, explanation);
+        })
+    );
 }
   
 /**
@@ -308,33 +320,8 @@ export async function generateGlobalSummaries(collectionName: string): Promise<{
  *  - Generate updated explanations reflecting the changes,
  *  - And store the updated documentation in the RAG.
  */
-export async function updateNLDocumentationWithDiff(collectionName: string, diffContent: string): Promise<void> {
-    // Step 1: Extract a broader code context from the diff.
-    const contextMessages = [
-      {
-        role: "system",
-        content: `You are a code context extraction assistant. Based on the following diff, extract the larger code context surrounding the changes.`
-      },
-      {
-        role: "user",
-        content: diffContent
-      }
-    ];
-    const codeContext = await getLLMResponse(contextMessages) || "";
-    
-    // Step 2: Identify the affected features based on the extracted context.
-    const featureMessages = [
-      {
-        role: "system",
-        content: `You are a software analysis assistant. Analyze the following code context extracted from a diff and identify which functionalities of the software are affected. Provide a list of feature names or descriptions in plain language.`
-      },
-      {
-        role: "user",
-        content: codeContext
-      }
-    ];
-    const affectedFeatures = await getLLMResponse(featureMessages) || "";
-    
+export async function updateNLDocumentationWithDiff(collectionName: string, diffContent: string, affectedFeatures: any): Promise<void> {
+
     // Step 3: Retrieve the NL explanation documents corresponding to the affected features.
     const keywords = affectedFeatures.split(',').map((kw: string) => kw.trim());
     let relevantExplanations: string[] = [];
@@ -366,189 +353,18 @@ export async function updateNLDocumentationWithDiff(collectionName: string, diff
     ];
     const updatedDocumentation = await getLLMResponse(updateMessages) || "";
     
-    // Step 5: Store the updated documentation in the RAG.
-    const currentTime = Date.now();
-    const updateEntry = {
-      id: currentTime,
-      repository_id: 0,
-      source: "Updated Features Documentation",
-      type: 'nl_explanation',
-      content: updatedDocumentation.trim(),
-    };
+    // // Step 5: Store the updated documentation in the RAG.
+    // const currentTime = Date.now();
+    // const updateEntry = {
+    //   id: currentTime,
+    //   repository_id: 0,
+    //   source: "Updated Features Documentation",
+    //   type: 'nl_explanation',
+    //   content: updatedDocumentation.trim(),
+    // };
     
-    await insertSource(collectionName, updateEntry.repository_id, updateEntry.type, updateEntry.source, null, [[updateEntry.content]], null);
+    // await insertSource(collectionName, updateEntry.repository_id, updateEntry.type, updateEntry.source, null, [[updateEntry.content]], null);
 }
-
-export async function diffPrompt(
-    collectionName: string,
-    diff: any,
-    topK: number = 10
-  ) {
-
-    // Create a query vector using a representative technical phrase
-    const queryText = "Software engineer analysis of the diff";
-    const queryVector = await createEmbedding(queryText);
-    
-    // Retrieve only the topK most relevant RAG sources for source code analysis
-    const ragSources = await queryVectors(collectionName, queryVector, topK);
-    let ragSourceContent = ragSources.results.map((source: any) => source.con).join('\n');
-    
-    // Check token count and summarize if needed
-    if (countTokens(ragSourceContent) > tokenLimit) {
-      ragSourceContent = await summarizeContent(ragSourceContent);
-    }
-
-    diff = JSON.stringify(diff);
-
-    const messages = [
-        {
-            role: "system",
-            content: `You are an assistant specializing in software engineering tasks. You have just received a git diff of the codebase. The diff contains the changes made to the software. Your task is to review the diff and check if it represents a major advancement of the software. If so, identify the main changes. Return the response in the following JSON format:
-            {
-                "isMajorAdvancement": boolean,
-                "mainChanges": [string]
-            }
-            Here's the codebase in vector: ${ragSourceContent} and the changes are: ${diff}`
-        },
-        {
-            role: "user",
-            content: "Analyze the diff and return the response in JSON format."
-        },
-        {
-            role: "user",
-            content: `List 3 SEO articles with 100 words that could help future users in the reflection phase to understand these developments. Add the list in a new property 'seoArticleSuggestions' with the following JSON format:
-                "seoArticleSuggestions": [{
-                    "title": string,
-                    "content": string
-                }]
-            `
-        },
-    ]
-
-    const responseContent = await getLLMResponse(messages)
-    await updateNLDocumentationWithDiff(collectionName, diff)
-    
-    if (responseContent) {
-        const cleanedResponse = responseContent.trim();
-        try {
-          return JSON.parse(cleanedResponse);
-        } catch (parseError) {
-          console.error('Error parsing response:', parseError);
-          throw new Error('Failed to parse response from OpenAI.');
-        }
-    }
-      
-    return { status: 'error', message: 'No response from OpenAI.' };
-
-}
-
-/**
- * Generate a detailed explanation of the software based on its complete source code.
- * 
- * This function performs the following steps:
- * 1. Retrieve all code source entries from the RAG.
- * 2. For each file (or code entry), generate a plain language summary of its main functionalities.
- * 3. Combine the file summaries and, if necessary, recursively summarize them.
- * 4. Produce a final detailed explanation of the overall software.
- */
-export async function generateSoftwareExplanation(
-    collectionName: string
-  ): Promise<string> {
-    // Step 1: Retrieve all code entries from the RAG for source code
-    const codeEntries = await querySourceType(collectionName, 'source_code');
-    const fileSummaries: string[] = [];
-  
-    // Step 2: Process each file/entry individually
-    for (const entry of codeEntries.data) {
-      const fileContent = entry.content;
-      // Use fileName if provided, otherwise a generic identifier
-      const fileName = entry.fileName || "Unnamed File";
-      
-      // Ensure content does not exceed token limit; summarize if necessary
-      let contentToProcess = fileContent;
-      if (countTokens(contentToProcess) > tokenLimit) {
-        contentToProcess = await summarizeContent(contentToProcess);
-      }
-      
-      // Create a prompt to extract functionalities for this file
-      const messages = [
-        {
-          role: "system",
-          content: `You are a software analysis assistant. Analyze the following source code from the file "${fileName}" and provide a plain language summary of its main functionalities. Describe its role and contribution to the overall software in clear, everyday language.`
-        },
-        {
-          role: "user",
-          content: contentToProcess
-        }
-      ];
-      
-      const fileSummary = await getLLMResponse(messages);
-      if (fileSummary) {
-        fileSummaries.push(`File: ${fileName}\nSummary: ${fileSummary.trim()}`);
-      }
-    }
-  
-    // Step 3: Combine all file summaries into one text block
-    let combinedSummaries = fileSummaries.join('\n\n');
-  
-    // If the combined text exceeds the token limit, recursively summarize it
-    if (countTokens(combinedSummaries) > tokenLimit) {
-      combinedSummaries = await summarizeContent(combinedSummaries);
-    }
-  
-    // Step 4: Generate the final explanation based on the combined summaries
-    const finalMessages = [
-      {
-        role: "system",
-        content: `You are a software documentation assistant. Given the combined summaries of individual source code files, generate a detailed explanation of how the software works. Your explanation should be in plain language and cover the essential functionalities and overall architecture of the software.`
-      },
-      {
-        role: "user",
-        content: combinedSummaries
-      }
-    ];
-  
-    const finalExplanation = await getLLMResponse(finalMessages);
-    return finalExplanation ? finalExplanation.trim() : "Failed to generate software explanation.";
-}
-
-function chunkContent(content: string, maxChars: number): string[] {
-    const chunks: string[] = [];
-    let currentChunk = '';
-
-    for (const line of content.split(' ')) {
-        // Check if adding the current line exceeds the maxChars
-        // If the current line exceeds maxChars, push the current chunk and start a new one
-        if (line.length > maxChars) {
-            if (currentChunk.trim().length > 0) {
-                chunks.push(currentChunk.trim());
-            }
-            // If a single line exceeds the limit, split it into smaller chunks
-            let startIdx = 0;
-            while (startIdx < line.length) {
-                const endIdx = Math.min(startIdx + maxChars, line.length);
-                chunks.push(line.slice(startIdx, endIdx));
-                startIdx = endIdx;
-            }
-            currentChunk = ''; // Reset currentChunk
-        } else if ((currentChunk + line).length > maxChars) {
-            // If adding the line exceeds maxChars, push the current chunk and start a new one
-            chunks.push(currentChunk.trim());
-            currentChunk = line;
-        } else {
-            // Otherwise, add the line to the current chunk
-            currentChunk += line + ' ';
-        }
-    }
-
-    // Push the last chunk if it has content
-    if (currentChunk.trim() !== '') {
-        chunks.push(currentChunk.trim());
-    }
-
-    return chunks;
-}
-
 
 async function summarizeChunk(text: string, remainingTokens: number): Promise<string> {
 
@@ -590,7 +406,7 @@ export async function extractProjectSummary(
 
         if (tokens.length > maxTokens) {
             // If the content exceeds maxTokens, chunk it into smaller parts
-            const chunks = chunkContent(sourceContent, maxTokens);
+            const chunks = splitIntoChunks(sourceContent, maxTokens);
             for (const chunk of chunks) {
                     const summarizedChunk = await summarizeChunk(chunk, maxTokens);
                     truncatedSources.push(summarizedChunk);
@@ -651,14 +467,14 @@ export async function projectInsightsPrompt(
     }
 }
 
-export async function marketingInsightsPrompt( summary: string ) {
-    const message = `Here is the project summary extracted from the source code: ${summary}`
-    const maxLimit = tokenLimit - countTokens(message)
-    
+export async function marketingInsightsPrompt(summary: string) {
+    const message = `Here is the project summary extracted from the source code: ${summary}`;
+    const maxLimit = tokenLimit - countTokens(message);
+
     const messages = [
         {
             role: "system",
-            content: `You are a marketing assistant specialized in converting technical summaries into marketing insights. Analyze the following project summary and return a JSON object with the structure:
+            content: `You are a software documentation assistant. Based on the provided natural language explanations of individual source code files, generate a comprehensive overview of the software. Explain its overall purpose, main functionalities, and architecture in plain language. Return a JSON object with the structure:
             {
                 "projectOverview": string,
                 "keyFeatures": [string],
@@ -675,17 +491,22 @@ export async function marketingInsightsPrompt( summary: string ) {
             content: message
         }
     ];
-    
-    const responseContent = await getLLMResponse(messages,maxLimit);
+
+    const responseContent = await getLLMResponse(messages, maxLimit);
+    console.log(responseContent);
 
     if (responseContent) {
-      const cleanedResponse = responseContent.trim();
-      try {
-        return JSON.parse(cleanedResponse);
-      } catch (parseError) {
-        console.error('Error parsing response:', parseError);
-        throw new Error('Failed to parse response from OpenAI.');
-      }
+        const cleanedResponse = responseContent
+            .trim()
+            .replace(/[\u0000-\u001F\u007F-\u009F]/g, ''); // Remove control characters
+
+        try {
+            return JSON.parse(cleanedResponse);
+        } catch (parseError) {
+            console.error('Error parsing response:', parseError);
+            console.error('Cleaned response:', cleanedResponse);
+            throw new Error('Failed to parse response from OpenAI.');
+        }
     }
 
     throw new Error('No response from OpenAI.');
@@ -719,14 +540,107 @@ export async function technicalInsightsPrompt( summary: string) {
     const responseContent = await getLLMResponse(messages,maxLimit);
 
     if (responseContent) {
-      const cleanedResponse = responseContent.trim();
-      try {
-        return JSON.parse(cleanedResponse);
-      } catch (parseError) {
-        console.error('Error parsing response:', parseError);
-        throw new Error('Failed to parse response from OpenAI.');
-      }
+        const cleanedResponse = responseContent
+            .trim()
+            .replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+        try {
+            return JSON.parse(cleanedResponse);
+        } catch (parseError) {
+            console.error('Error parsing response:', parseError);
+            throw new Error('Failed to parse response from OpenAI.');
+        }
     }
 
     throw new Error('No response from OpenAI.');
+}
+
+export async function analyzeDiffPrompt(
+    collectionName: string,
+    diffContent: any,
+    topK: number = 10
+  ) {
+    console.log(diffContent)
+    // Create a query vector using a representative technical phrase
+    const queryText = "Software engineer analysis of the diff";
+    const queryVector = await createEmbedding(queryText);
+    
+    // Retrieve only the topK most relevant RAG sources for source code analysis
+    const ragSources = await queryVectors(collectionName, queryVector, topK);
+    let ragSourceContent = ragSources.results.map((source: any) => source.content).join('\n');
+    
+    // Check token count and summarize if needed
+    if (countTokens(ragSourceContent) > tokenLimit) {
+      ragSourceContent = await summarizeContent(ragSourceContent);
+    }
+
+    diffContent = JSON.stringify(diffContent);
+    // Step 1: Extract a broader code context from the diff.
+    const contextMessages = [
+    {
+        role: "system",
+        content: `You are a code context extraction assistant. Based on the following diff, extract the larger code context surrounding the changes.`
+    },
+    {
+        role: "user",
+        content: diffContent
+    }
+    ];
+    const codeContext = await getLLMResponse(contextMessages) || "";
+      
+    console.log(codeContext)
+    // Step 2: Identify the affected features based on the extracted context.
+    const featureMessages = [
+    {
+        role: "system",
+        content: `You are a software analysis assistant. Analyze the following code context extracted from a diff and identify which functionalities of the software are affected. Provide a list of feature names or descriptions in plain language.`
+    },
+    {
+        role: "user",
+        content: codeContext
+    }
+    ];
+    const affectedFeatures = await getLLMResponse(featureMessages) || "";
+    console.log(affectedFeatures)
+
+
+    // const messages = [
+    //     {
+    //         role: "system",
+    //         content: `You are an assistant specializing in software engineering tasks. You have just received a git diff of the codebase. The diff contains the changes made to the software. Your task is to review the diff and check if it represents a major advancement of the software. If so, identify the main changes. Return the response in the following JSON format:
+    //         {
+    //             "isMajorAdvancement": boolean,
+    //             "mainChanges": [string]
+    //         }
+    //         Here's the codebase in vector: ${ragSourceContent} and the changes are: ${diff}`
+    //     },
+    //     {
+    //         role: "user",
+    //         content: "Analyze the diff and return the response in JSON format."
+    //     },
+    //     {
+    //         role: "user",
+    //         content: `List 3 SEO articles with 100 words that could help future users in the reflection phase to understand these developments. Add the list in a new property 'seoArticleSuggestions' with the following JSON format:
+    //             "seoArticleSuggestions": [{
+    //                 "title": string,
+    //                 "content": string
+    //             }]
+    //         `
+    //     },
+    // ]
+
+    // const responseContent = await getLLMResponse(messages)
+    // await updateNLDocumentationWithDiff(collectionName, diffContent)
+    
+    // if (responseContent) {
+    //     const cleanedResponse = responseContent.trim();
+    //     try {
+    //       return JSON.parse(cleanedResponse);
+    //     } catch (parseError) {
+    //       console.error('Error parsing response:', parseError);
+    //       throw new Error('Failed to parse response from OpenAI.');
+    //     }
+    // }
+      
+    return { status: 'error', message: 'No response from OpenAI.' };
+
 }
